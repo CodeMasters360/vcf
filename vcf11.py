@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QMessageBox, QMenu, QMenuBar, QStatusBar, QScrollArea,
     QHeaderView
 )
-from PyQt6.QtGui import QAction, QPixmap, QImage, QGuiApplication
+from PyQt6.QtGui import QAction, QPixmap, QImage, QGuiApplication, QBrush, QColor
 from PyQt6.QtCore import Qt, QSize
 from PIL import Image
 import io
@@ -131,10 +131,12 @@ class ContactViewer(QMainWindow):
 
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(['#', 'Name', 'Phone', 'Additional Phones', 'Photo', 'Select'])
-        self.tree.setSortingEnabled(True)
+        self.tree.setSortingEnabled(False)  # Disable built-in sorting
         self.tree.header().sectionClicked.connect(self.handle_header_click)
         self.tree.itemDoubleClicked.connect(self.show_photo)
         self.tree.itemChanged.connect(self.handle_item_changed)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self.show_context_menu)
 
         header = self.tree.header()
         header.setSectionsClickable(True)
@@ -143,7 +145,7 @@ class ContactViewer(QMainWindow):
         self.tree.setColumnWidth(0, 50)
         self.tree.setColumnWidth(1, 200)
         self.tree.setColumnWidth(2, 150)
-        self.tree.setColumnWidth(3, 200)
+        self.tree.setColumnWidth(3, 120)  # Reduced from 200 to 120
         self.tree.setColumnWidth(4, 60)
         self.tree.setColumnWidth(5, 80)
 
@@ -152,16 +154,32 @@ class ContactViewer(QMainWindow):
         self.clear_btn = QPushButton('Clear')
         self.clear_btn.clicked.connect(self.clear_search)
 
+        # Add selection control buttons
+        self.select_all_btn = QPushButton('Select All')
+        self.select_all_btn.clicked.connect(self.select_all)
+        self.deselect_all_btn = QPushButton('Deselect All')
+        self.deselect_all_btn.clicked.connect(self.deselect_all)
+        self.invert_selection_btn = QPushButton('Invert Selection')
+        self.invert_selection_btn.clicked.connect(self.invert_selection)
+
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setFixedSize(300, 300)
+        self.image_label.setFixedSize(400, 400)  # Change from (300, 300) to desired size
 
         search_layout = QHBoxLayout()
         search_layout.addWidget(self.search_box)
         search_layout.addWidget(self.clear_btn)
 
+        # Add selection buttons layout
+        selection_layout = QHBoxLayout()
+        selection_layout.addWidget(self.select_all_btn)
+        selection_layout.addWidget(self.deselect_all_btn)
+        selection_layout.addWidget(self.invert_selection_btn)
+        selection_layout.addStretch()  # Push buttons to the left
+
         main_layout = QVBoxLayout()
         main_layout.addLayout(search_layout)
+        main_layout.addLayout(selection_layout)
         main_layout.addWidget(self.tree)
 
         image_scroll = QScrollArea()
@@ -196,10 +214,14 @@ class ContactViewer(QMainWindow):
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
+        
+        # Add permanent widgets to status bar
+        self.contact_count_label = QLabel("Contacts: 0")
+        self.selected_count_label = QLabel("Selected: 0")
+        self.status_bar.addPermanentWidget(self.contact_count_label)
+        self.status_bar.addPermanentWidget(self.selected_count_label)
 
     def handle_header_click(self, logical_index):
-        if logical_index == 0:
-            return
         self.sort_contacts(logical_index)
 
     def import_vcf(self):
@@ -232,19 +254,46 @@ class ContactViewer(QMainWindow):
             ])
             item.setCheckState(5, Qt.CheckState.Checked if contact.selected else Qt.CheckState.Unchecked)
             item.setData(0, Qt.ItemDataRole.UserRole, contact)
+            
+            # Set background color for selected contacts
+            if contact.selected:
+                selected_color = QColor(173, 216, 230)  # Light blue background
+                for col in range(6):  # Apply to all columns
+                    item.setBackground(col, QBrush(selected_color))
+            else:
+                # Reset to default background
+                for col in range(6):
+                    item.setBackground(col, QBrush())
+            
             self.tree.addTopLevelItem(item)
         
+        # Update header sort indicator
+        if self.sort_column != 0:
+            self.tree.header().setSortIndicator(self.sort_column, self.sort_order)
+        else:
+            self.tree.header().setSortIndicator(-1, self.sort_order)  # Clear sort indicator
+        
         self.tree.itemChanged.connect(self.handle_item_changed)
+        self.update_status_counts()
 
     def handle_item_changed(self, item, column):
         if column == 5:
             contact = item.data(0, Qt.ItemDataRole.UserRole)
             contact.selected = item.checkState(5) == Qt.CheckState.Checked
+            
+            # Update row background color based on selection
+            if contact.selected:
+                selected_color = QColor(173, 216, 230)  # Light blue background
+                for col in range(6):  # Apply to all columns
+                    item.setBackground(col, QBrush(selected_color))
+            else:
+                # Reset to default background
+                for col in range(6):
+                    item.setBackground(col, QBrush())
+            
+            self.update_status_counts()
 
     def sort_contacts(self, column):
-        if column == 0:
-            return
-        
         if column == self.sort_column:
             self.sort_order = (
                 Qt.SortOrder.DescendingOrder 
@@ -255,7 +304,18 @@ class ContactViewer(QMainWindow):
             self.sort_column = column
             self.sort_order = Qt.SortOrder.AscendingOrder
 
-        if column == 1:
+        if column == 0:  # Row number column - reset to original order
+            self.contacts = self.all_contacts.copy()
+            # Apply current search filter if active
+            search_term = self.search_box.text().lower().replace('ي', 'ی').replace('ك', 'ک')
+            if search_term:
+                self.contacts = [
+                    c for c in self.contacts
+                    if (search_term in c.name.lower() or 
+                        (c.phone and search_term in c.phone) or 
+                        (c.additional_phones and search_term in c.additional_phones))
+                ]
+        elif column == 1:
             self.contacts.sort(key=lambda x: x.name.lower(), reverse=self.sort_order == Qt.SortOrder.DescendingOrder)
         elif column == 2:
             self.contacts.sort(key=lambda x: x.phone or '', reverse=self.sort_order == Qt.SortOrder.DescendingOrder)
@@ -397,6 +457,64 @@ class ContactViewer(QMainWindow):
 
         if msg.clickedButton() == copy_btn:
             QGuiApplication.clipboard().setText(message)
+
+    def show_context_menu(self, position):
+        item = self.tree.itemAt(position)
+        if not item:
+            return
+            
+        # Get the column that was clicked
+        column = self.tree.columnAt(position.x())
+        
+        # Only show context menu for specific columns (0=# 1=Name, 2=Phone, 3=Additional Phones)
+        if column not in [0, 1, 2, 3]:
+            return
+            
+        # Get the text from the clicked cell
+        cell_text = item.text(column)
+        if not cell_text or cell_text in ['No Phone', '-']:
+            return
+            
+        # Create context menu
+        context_menu = QMenu(self)
+        
+        # Add copy action
+        copy_text = f"Copy '{cell_text[:30]}{'...' if len(cell_text) > 30 else ''}'"
+        copy_action = QAction(copy_text, self)
+        copy_action.triggered.connect(lambda: self.copy_to_clipboard(cell_text))
+        context_menu.addAction(copy_action)
+        
+        # Show the context menu
+        context_menu.exec(self.tree.mapToGlobal(position))
+
+    def copy_to_clipboard(self, text):
+        QGuiApplication.clipboard().setText(text)
+        self.status_bar.showMessage(f"Copied to clipboard: {text[:50]}{'...' if len(text) > 50 else ''}")
+
+    def select_all(self):
+        for contact in self.contacts:
+            contact.selected = True
+        self.display_contacts()
+        self.status_bar.showMessage("All contacts selected")
+
+    def deselect_all(self):
+        for contact in self.contacts:
+            contact.selected = False
+        self.display_contacts()
+        self.status_bar.showMessage("All contacts deselected")
+
+    def invert_selection(self):
+        for contact in self.contacts:
+            contact.selected = not contact.selected
+        self.display_contacts()
+        self.status_bar.showMessage("Selection inverted")
+
+    def update_status_counts(self):
+        total_contacts = len(self.contacts)
+        selected_contacts = len([c for c in self.contacts if c.selected])
+        
+        self.contact_count_label.setText(f"Contacts: {total_contacts}")
+        self.selected_count_label.setText(f"Selected: {selected_contacts}")
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)

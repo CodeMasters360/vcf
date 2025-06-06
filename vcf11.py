@@ -1,0 +1,405 @@
+import sys
+import binascii
+from base64 import b64decode
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QTreeWidget, QTreeWidgetItem, QLineEdit, QPushButton, QLabel,
+    QFileDialog, QMessageBox, QMenu, QMenuBar, QStatusBar, QScrollArea,
+    QHeaderView
+)
+from PyQt6.QtGui import QAction, QPixmap, QImage, QGuiApplication
+from PyQt6.QtCore import Qt, QSize
+from PIL import Image
+import io
+
+class Contact:
+    def __init__(self, data):
+        self.name = data['name']
+        self.phone = data['phone']
+        self.additional_phones = data['additional_phones']
+        self.original_lines = data['original_lines']
+        self.has_photo = data['has_photo']
+        self.photo_data = data['photo_data']
+        self.selected = False
+
+class VcfParser:
+    def parse_vcf(self, vcf_content):
+        lines = vcf_content.strip().split('\n')
+        vcard_entries = []
+        current_entry = []
+        in_vcard = False
+
+        for line in lines:
+            line = line.strip()
+            if line.startswith('BEGIN:VCARD'):
+                if in_vcard:
+                    vcard_entries.append(current_entry)
+                current_entry = [line]
+                in_vcard = True
+            elif line.startswith('END:VCARD'):
+                current_entry.append(line)
+                vcard_entries.append(current_entry)
+                current_entry = []
+                in_vcard = False
+            elif in_vcard:
+                current_entry.append(line)
+
+        if in_vcard and current_entry:
+            vcard_entries.append(current_entry)
+
+        contacts = []
+        for entry in vcard_entries:
+            processed_lines = []
+            current_line = None
+
+            for line in entry:
+                if line.startswith('='):
+                    if current_line is not None:
+                        current_line += line[1:]
+                else:
+                    if current_line is not None:
+                        processed_lines.append(current_line)
+                    current_line = line
+
+            if current_line is not None:
+                processed_lines.append(current_line)
+
+            name = None
+            phones = []
+            photo_data = None
+            original_lines = entry.copy()
+            has_photo = False
+
+            for idx, line in enumerate(processed_lines):
+                if line.startswith('END:VCARD'):
+                    break
+                if ':' not in line:
+                    continue
+                key, value = line.split(':', 1)
+                key = key.upper()
+
+                if key.startswith('N'):
+                    if 'CHARSET=UTF-8' in key and 'ENCODING=QUOTED-PRINTABLE' in key:
+                        value = value.replace('==', '=')
+                        try:
+                            decoded_bytes = binascii.a2b_qp(value)
+                            name = decoded_bytes.decode('utf-8').replace(';', ' ')
+                        except Exception as e:
+                            name = f"Error decoding N: {e}"
+                elif key.startswith('TEL'):
+                    phones.append(value)
+                elif key.startswith('PHOTO'):
+                    has_photo = True
+                    if 'BASE64' in key:
+                        photo_lines = [value]
+                        next_idx = idx + 1
+                        while next_idx < len(processed_lines):
+                            next_line = processed_lines[next_idx]
+                            if next_line.startswith(' ') or ':' not in next_line:
+                                photo_lines.append(next_line.strip())
+                                next_idx += 1
+                            else:
+                                break
+                        photo_data = ''.join(photo_lines).replace(' ', '').replace('\n', '')
+
+            if name:
+                main_phone = phones[0] if phones else None
+                additional_phones = ', '.join(phones[1:]) if len(phones) > 1 else ''
+                contacts.append(Contact({
+                    'name': name.replace('ي', 'ی').replace('ك', 'ک'),
+                    'phone': main_phone,
+                    'additional_phones': additional_phones,
+                    'original_lines': original_lines,
+                    'has_photo': has_photo,
+                    'photo_data': photo_data
+                }))
+
+        return contacts
+
+class ContactViewer(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.all_contacts = []
+        self.contacts = []
+        self.sort_column = 1
+        self.sort_order = Qt.SortOrder.AscendingOrder
+        self.initUI()
+
+    def initUI(self):
+        self.setWindowTitle('VCF Viewer')
+        self.setGeometry(100, 100, 1000, 700)
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(['#', 'Name', 'Phone', 'Additional Phones', 'Photo', 'Select'])
+        self.tree.setSortingEnabled(True)
+        self.tree.header().sectionClicked.connect(self.handle_header_click)
+        self.tree.itemDoubleClicked.connect(self.show_photo)
+        self.tree.itemChanged.connect(self.handle_item_changed)
+
+        header = self.tree.header()
+        header.setSectionsClickable(True)
+        header.setSortIndicatorShown(True)
+
+        self.tree.setColumnWidth(0, 50)
+        self.tree.setColumnWidth(1, 200)
+        self.tree.setColumnWidth(2, 150)
+        self.tree.setColumnWidth(3, 200)
+        self.tree.setColumnWidth(4, 60)
+        self.tree.setColumnWidth(5, 80)
+
+        self.search_box = QLineEdit()
+        self.search_box.textChanged.connect(self.filter_contacts)
+        self.clear_btn = QPushButton('Clear')
+        self.clear_btn.clicked.connect(self.clear_search)
+
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setFixedSize(300, 300)
+
+        search_layout = QHBoxLayout()
+        search_layout.addWidget(self.search_box)
+        search_layout.addWidget(self.clear_btn)
+
+        main_layout = QVBoxLayout()
+        main_layout.addLayout(search_layout)
+        main_layout.addWidget(self.tree)
+
+        image_scroll = QScrollArea()
+        image_scroll.setWidget(self.image_label)
+        image_scroll.setWidgetResizable(True)
+
+        central_widget = QWidget()
+        central_layout = QHBoxLayout()
+        central_layout.addLayout(main_layout, 70)
+        central_layout.addWidget(image_scroll, 30)
+        central_widget.setLayout(central_layout)
+        self.setCentralWidget(central_widget)
+
+        menubar = self.menuBar()
+        file_menu = menubar.addMenu('File')
+
+        import_action = QAction('Import VCF', self)
+        import_action.triggered.connect(self.import_vcf)
+        file_menu.addAction(import_action)
+
+        save_action = QAction('Save VCF', self)
+        save_action.triggered.connect(self.save_vcf)
+        file_menu.addAction(save_action)
+
+        delete_action = QAction('Delete Selected', self)
+        delete_action.triggered.connect(self.delete_selected)
+        file_menu.addAction(delete_action)
+
+        delete_no_phone = QAction('Delete Without Phone', self)
+        delete_no_phone.triggered.connect(self.delete_contacts_without_phone)
+        file_menu.addAction(delete_no_phone)
+
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+
+    def handle_header_click(self, logical_index):
+        if logical_index == 0:
+            return
+        self.sort_contacts(logical_index)
+
+    def import_vcf(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Open VCF", "", "VCF Files (*.vcf)")
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            parser = VcfParser()
+            self.all_contacts = parser.parse_vcf(content)
+            self.contacts = self.all_contacts.copy()
+            self.display_contacts()
+            self.status_bar.showMessage("File loaded successfully")
+        except Exception as e:
+            self.show_error("Import Error", str(e))
+
+    def display_contacts(self):
+        self.tree.itemChanged.disconnect(self.handle_item_changed)
+        self.tree.clear()
+        
+        for index, contact in enumerate(self.contacts, start=1):
+            item = QTreeWidgetItem([
+                str(index),
+                contact.name,
+                contact.phone or 'No Phone',
+                contact.additional_phones or '-',
+                '🖼️' if contact.has_photo else '',
+            ])
+            item.setCheckState(5, Qt.CheckState.Checked if contact.selected else Qt.CheckState.Unchecked)
+            item.setData(0, Qt.ItemDataRole.UserRole, contact)
+            self.tree.addTopLevelItem(item)
+        
+        self.tree.itemChanged.connect(self.handle_item_changed)
+
+    def handle_item_changed(self, item, column):
+        if column == 5:
+            contact = item.data(0, Qt.ItemDataRole.UserRole)
+            contact.selected = item.checkState(5) == Qt.CheckState.Checked
+
+    def sort_contacts(self, column):
+        if column == 0:
+            return
+        
+        if column == self.sort_column:
+            self.sort_order = (
+                Qt.SortOrder.DescendingOrder 
+                if self.sort_order == Qt.SortOrder.AscendingOrder 
+                else Qt.SortOrder.AscendingOrder
+            )
+        else:
+            self.sort_column = column
+            self.sort_order = Qt.SortOrder.AscendingOrder
+
+        if column == 1:
+            self.contacts.sort(key=lambda x: x.name.lower(), reverse=self.sort_order == Qt.SortOrder.DescendingOrder)
+        elif column == 2:
+            self.contacts.sort(key=lambda x: x.phone or '', reverse=self.sort_order == Qt.SortOrder.DescendingOrder)
+        elif column == 3:
+            self.contacts.sort(key=lambda x: len(x.additional_phones.split(', ')) if x.additional_phones else 0, reverse=self.sort_order == Qt.SortOrder.DescendingOrder)
+        elif column == 4:
+            self.contacts.sort(key=lambda x: not x.has_photo, reverse=self.sort_order == Qt.SortOrder.DescendingOrder)
+        elif column == 5:
+            self.contacts.sort(key=lambda x: not x.selected, reverse=self.sort_order == Qt.SortOrder.DescendingOrder)
+            
+        self.display_contacts()
+
+    def filter_contacts(self):
+        search_term = self.search_box.text().lower().replace('ي', 'ی').replace('ك', 'ک')
+        if not search_term:
+            self.contacts = self.all_contacts.copy()
+        else:
+            self.contacts = [
+                c for c in self.all_contacts
+                if (search_term in c.name.lower() or 
+                    (c.phone and search_term in c.phone) or 
+                    (c.additional_phones and search_term in c.additional_phones))
+            ]
+        self.display_contacts()
+
+    def clear_search(self):
+        self.search_box.clear()
+        self.contacts = self.all_contacts.copy()
+        self.display_contacts()
+
+    def show_photo(self, item):
+        contact = item.data(0, Qt.ItemDataRole.UserRole)
+        if contact.photo_data:
+            try:
+                data = contact.photo_data
+                missing_padding = len(data) % 4
+                if missing_padding:
+                    data += '=' * (4 - missing_padding)
+                
+                image_data = b64decode(data)
+                
+                header = image_data[:32].decode('ascii', errors='ignore')
+                if 'JFIF' not in header and 'PNG' not in header:
+                    raise ValueError("Invalid image format")
+                
+                image = Image.open(io.BytesIO(image_data))
+                image.verify()
+                image = Image.open(io.BytesIO(image_data))
+                image.thumbnail((300, 300))
+                
+                qimage = QImage(image.tobytes(), image.width, image.height, QImage.Format.Format_RGB888)
+                pixmap = QPixmap.fromImage(qimage)
+                self.image_label.setPixmap(pixmap)
+                self.status_bar.showMessage("Photo displayed")
+            except Exception as e:
+                self.show_error("Image Error", str(e))
+        else:
+            self.image_label.clear()
+            self.status_bar.showMessage("No photo available")
+
+    def delete_selected(self):
+        selected_contacts = [c for c in self.all_contacts if c.selected]
+        if not selected_contacts:
+            self.show_warning("No Selection", "No contacts selected")
+            return
+            
+        self.all_contacts = [c for c in self.all_contacts if not c.selected]
+        self.contacts = self.all_contacts.copy()
+        self.display_contacts()
+        self.status_bar.showMessage(f"Deleted {len(selected_contacts)} contacts")
+
+    def delete_contacts_without_phone(self):
+        initial_count = len(self.contacts)
+        self.contacts = [c for c in self.contacts if c.phone and c.phone.strip()]
+        removed_count = initial_count - len(self.contacts)
+        
+        if removed_count > 0:
+            self.all_contacts = [c for c in self.all_contacts if c.phone and c.phone.strip()]
+            self.display_contacts()
+            self.status_bar.showMessage(f"Removed {removed_count} contacts without phone numbers")
+        else:
+            self.status_bar.showMessage("No contacts without phone numbers found")
+
+    def save_vcf(self):
+        if not self.contacts:
+            self.show_warning("Empty List", "No contacts to save")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save VCF", "", "VCF Files (*.vcf)")
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                for contact in self.contacts:
+                    in_photo = False
+                    for line in contact.original_lines:
+                        stripped_line = line.strip()
+                        
+                        if stripped_line == '':
+                            f.write('\n')
+                            continue
+                            
+                        if stripped_line.upper().startswith('PHOTO'):
+                            f.write(stripped_line + '\n')
+                            in_photo = True
+                        elif in_photo:
+                            if stripped_line.startswith('END:VCARD'):
+                                f.write(line + '\n')
+                                in_photo = False
+                            else:
+                                f.write(' ' + line.lstrip() + '\n')
+                        else:
+                            f.write(line + '\n')
+            self.status_bar.showMessage("VCF saved successfully")
+        except Exception as e:
+            self.show_error("Saving Error", str(e))
+
+    def show_error(self, title, message):
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Icon.Critical)
+        msg.setWindowTitle(title)
+        msg.setText(message)
+        copy_btn = msg.addButton("Copy Error", QMessageBox.ButtonRole.ActionRole)
+        msg.addButton(QMessageBox.StandardButton.Ok)
+        msg.exec()
+
+        if msg.clickedButton() == copy_btn:
+            QGuiApplication.clipboard().setText(message)
+
+    def show_warning(self, title, message):
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setWindowTitle(title)
+        msg.setText(message)
+        copy_btn = msg.addButton("Copy Message", QMessageBox.ButtonRole.ActionRole)
+        msg.addButton(QMessageBox.StandardButton.Ok)
+        msg.exec()
+
+        if msg.clickedButton() == copy_btn:
+            QGuiApplication.clipboard().setText(message)
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = ContactViewer()
+    window.show()
+    sys.exit(app.exec())
